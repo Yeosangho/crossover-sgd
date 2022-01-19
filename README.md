@@ -26,7 +26,7 @@
   * 모델을 분할하고, 분할된 모델의 세그먼트 별로 각각 가십 통신 수행
   * 가십 통신을 위한 모델 갱신 과정에서 특정 로컬 모델에 편향된 모델 갱신을 하지 않기 위해 Load balanced random network topology 를 구성함.
 
-   <img src="images/eval1.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
+   <img src="images/eval1.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
 
   * 머신 수의 증가에 따른 가십 통신의 근본적인 모델 갱신 오차를 줄이기 위해 계층적 통신  기법을 적용함. 
 
@@ -43,7 +43,7 @@
   * SGP(Stochastic Gradient Push) : 그 당시(2019-2020) 최신 가십 통신 기법
   * Crossover-SGD : 제안 가십 통신 기법 
 * 하이퍼 파라미터 설정
-   <img src="images/eval2.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
+   <img src="images/eval2.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
 
 -----
 ### 4.2 Large minibatch 문제 조건에서의 가십 통신 기법 분석. 
@@ -54,9 +54,9 @@
   * AllReduce-SGD 는 Large mini-batch 문제가 심화될 수록(즉, 미니배치 크기가 증가할 수록) 더 큰 영향(더 낮은 수렴 정확도)을 받음. 
     * 이는 예기치못한 결과로써 가십 통신이 가지는 탐험적 특성이 영향을 주었을것으로 가정함. 
 
-   <img src="images/eval5.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
+   <img src="images/eval5.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
 
-    <img src="images/eval6.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>  
+    <img src="images/eval6.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>  
 
 
 -----
@@ -65,12 +65,12 @@
 * 실험 결과 
   * 학습 확장성 : 기존 Stochastic gradient push 대비 더 높은 학습 확장성을 가지며, 계층적 통신 기법을 적용하는 경우, 가십 통신을 하는 머신의 수를 제한할 수 있으므로 학습 확장성이 유지됨을 확인함. 
 
-   <img src="images/eval3.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
+   <img src="images/eval3.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
 
 
   * 노드 확장성 : 기존 가십 기법 대비 노드 확장성은 낮으나, AllReduce 대비 노드 확장성이 높음을 확인함. 
 
-   <img src="images/eval4.png" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
+   <img src="images/eval4.PNG" width="100%" height="100%" title="px(픽셀) 크기 설정" alt="RubberDuck"></img>
 
 
 ---------------
