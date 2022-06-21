@@ -100,6 +100,8 @@ parser.add_argument('--cutmix_prob', default=1.0, type=float)
 parser.add_argument('--val_iter', default=1.0, type=int)
 parser.add_argument('--proc_per_node', default=2, type=int)
 parser.add_argument('--groupnum', default=8, type=int)
+parser.add_argument('--worker_size', default=8, type=int)
+parser.add_argument('--gpu_size', default=8, type=int)
 
 
 # Lighting data augmentation take from here - https://github.com/eladhoffer/convNet.pytorch/blob/master/preprocess.py
@@ -159,6 +161,8 @@ def find_block(model_name, name):
 def main():
 	args = parser.parse_args()
 	world_size = args.world_size
+	worker_size = args.worker_size
+	gpu_size = args.gpu_size
 	group_num = args.groupnum
 	batch_size = args.batch_size
 	lars_coef = args.lars_coef
@@ -218,7 +222,6 @@ def main():
 	#else :
 	#	GPU_NUM = 1
 	GPU_NUM =  rank % gpu_per_node
-
 	#print(f"GPU NUM {GPU_NUM}")
 	device = torch.device(f'cuda:{GPU_NUM}' if torch.cuda.is_available() else 'cpu')
 	torch.backends.cudnn.benchmark = True
@@ -246,12 +249,12 @@ def main():
 
 	dist.init_process_group(backend="mpi", world_size =world_size, rank=rank)
 
-	model = init_model()
 
 	#make sync_lars_group
 	groups = [] 
 	group_roots = []
 	group_size = int(world_size / group_num)
+	worker_per_gpu = int(worker_size / gpu_size)
 	for x in range(int(world_size / group_size)):
 		group = []
 		group_roots.append(x * group_size)
@@ -264,7 +267,14 @@ def main():
 	def init_weights(m):
 		if type(m) == nn.Linear or type(m) == nn.Conv2d:
 			torch.nn.init.kaiming_uniform_(m.weight)
-	model.apply(init_weights)
+
+	models = []
+	for i in range(worker_per_gpu):
+		model = init_model()
+		models.append(model)
+
+	for model in models : 
+		model.apply(init_weights)
 	crossover_params = []
 
 	if(args.chromosome == 'coarse'):
@@ -274,7 +284,7 @@ def main():
 		model_name = ['-1','layer1.0', 'layer1.1',  'layer1.2','layer2.0', 'layer2.1', 'layer2.2', 'layer2.3', 'layer3.0', 'layer3.1', 'layer3.2', 'layer3.3', 'layer3.4', 'layer3.5', 'layer4.0', 'layer4.1', 'layer4.2','fc']
 
 	layer_idx = []
-	for idx, (n, param) in enumerate(model.named_parameters()):
+	for idx, (n, param) in enumerate(models[0].named_parameters()):
 		print(f"parameter_names {n}")
 		if(n == 'conv1.weight' or n == 'bn1.weight' or n == 'bn1.bias'):
 			old_block = 0
@@ -284,6 +294,7 @@ def main():
 				layer_idx.append(idx)
 				print(n)
 			old_block = find_block(model_name, n)[0] if(is_changed) else old_block
+
 	layer_idx.append(len(list(model.parameters())))		
 	print(layer_idx)		
 
@@ -295,13 +306,13 @@ def main():
 	#criterion = nn.CrossEntropyLoss()
 	criterion = LabelSmoothingLoss(1000)
 	
-	#recursive_batch_norm_momentum(model, momentum=1.0)
 	
-	#optimizer = torch.optim.SGD(model.parameters() , lr=baselr, momentum=0.9, nesterov=True)
-	if(lars == True):
+	optimizers = []
+	for model in models:
 		optimizer = LARS(model, model.parameters(), lr=baselr, momentum=0.96, weight_decay=weight_decay, eta=lars_coef, max_epoch=maxepoch, dist=dist, world_size=world_size, amp=amp, rank=rank)
-	if(amp_flag == True):
 		model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+		optimizers.append(optimizer)
+
 	optimizer.zero_grad()
 	_train_loader = loader.__iter__()
 
@@ -316,8 +327,6 @@ def main():
 
 	iter_num = 0
 	global_itr = 0
-	mygroup = int(rank/group_size)
-	dist.barrier()
 
 	for epoch in range(0, maxepoch):
 		batch_time = time.time()
@@ -332,79 +341,57 @@ def main():
 		len_loader = len(_train_loader)
 		model.train()
 		for itr,(batch, target) in enumerate(_train_loader, start=0):
-			#if(itr == 22):
-			#	break
-			a = torch.zeros(1).cuda()
 
-			if((rank % proc_per_gpu) !=  proc_per_gpu -1 ):
-				#completed = dist.irecv(tensor=a, src=rank+1)
-				#completed.wait()
-				dist.recv(tensor=a, src=rank+1)
-			#print(rank)
+
 
 			global_itr = global_itr + 1
 			minibatch_time = time.time()
-			
-
 			target = target.cuda()
 
 			batch = batch.cuda()
+			batch_size = batch.shape[0]
+			batch_size_per_worker = int(batch_size / worker_per_gpu )
 
-			r = np.random.rand(1)
-			loss = 0
-
-			output = model(batch)
-			del batch
-			loss = criterion(output, target)
-			del target 
-			del output
-
-
-			loss = loss /local_itr
-
-			#recursive_batch_norm_sync(model, world_size, dist)
-
-			if(amp_flag==True):
-				with amp.scale_loss(loss, optimizer, delay_overflow_check=True) as scaled_loss:
+			for j in range(worker_per_gpu):
+				if j < worker_per_gpu-1 :
+					batch_per_worker = batch[j*batch_size_per_worker:(j+1)*batch_size_per_worker]
+					target_per_worker = target[j*batch_size_per_worker:(j+1)*batch_size_per_worker]
+				else :
+					batch_per_worker = batch[j*batch_size_per_worker:]
+					target_per_worker = target[j*batch_size_per_worker:]					
+				loss = 0
+				output = models[j](batch_per_worker)
+				loss = criterion(output, target_per_worker)
+				loss = loss /local_itr
+		
+				with amp.scale_loss(loss, optimizers[j], delay_overflow_check=True) as scaled_loss:
 					scaled_loss.backward()
-					del scaled_loss
-			else:
-				loss.backward()
-
-			if( (rank % proc_per_gpu) !=0):
-				dist.send(tensor=a, dst=rank-1)
-
-			#if((itr %  local_itr == local_itr -1) or len(loader)-1 == itr):
+	
 			if(global_itr % local_itr == 0):
-				#apply_weight_decay(model, weight_decay_factor=5e-4, wo_bn=True)
-				if(amp_flag==True):
-					if(allreduce == True and sync_grad == True):
-						tensor_flatten = flatten_tensors_grad(list(amp.master_params(optimizer)))
-						dist.all_reduce(tensor_flatten, op=dist.ReduceOp.SUM)
-						tensor_flatten = tensor_flatten / world_size
-						tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizer)))	
-						for param_model, unflat in zip(amp.master_params(optimizer), tensor_unflatten):
-							param_model.grad.data = unflat					
-					if(crossover_flag == True and group_size > 1):
-						tensor_flatten = flatten_tensors_grad(list(amp.master_params(optimizer)))
-						dist.reduce(tensor_flatten, dst=group_roots[mygroup], op=dist.ReduceOp.SUM, group=groups[mygroup])
-						if(rank in group_roots):
-							tensor_flatten = tensor_flatten / group_size
-							tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizer)))	
-							for param_model, unflat in zip(amp.master_params(optimizer), tensor_unflatten):
-								param_model.grad.data = unflat	
+				if(amp_flag==True):			
+					tensor_flatten = flatten_tensors_grad(list(amp.master_params(optimizers[0])))
+					for j in range(worker_per_gpu-1):
+						tensor_flatten += flatten_tensors_grad(list(amp.master_params(optimizers[j+1])))
+					tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizers[0])))	
+					for param_model, unflat in zip(amp.master_params(optimizers[0]), tensor_unflatten):
+						param_model.grad.data = unflat
+				
+					mygroup = int(rank/(group_size))
+					tensor_flatten = flatten_tensors_grad(list(amp.master_params(optimizers[0])))
+					dist.reduce(tensor_flatten, dst=group_roots[mygroup], op=dist.ReduceOp.SUM, group=groups[mygroup])
+					if(rank in group_roots):
+						tensor_flatten = tensor_flatten / (group_size * worker_per_gpu)
+						tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizers[0])))	
+						for param_model, unflat in zip(amp.master_params(optimizers[0]), tensor_unflatten):
+							param_model.grad.data = unflat				
 
-							
-					#	crossover(model,  rank, world_size, model_name, rseed_per_rank, roulettes=roulettes, elitism=False, elite_ratio=elite_ratio, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag)		
-					#if((crossover_flag == False) and (allreduce == False) and (sync_grad == True)):
-					#	sgp(model, model_cp, rank, world_size, epoch, itr, len_loader, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag)
 					if(clip_grad == True):
-						torch.nn.utils.clip_grad_norm(amp.master_params(optimizer), 1000)					
-					
-	##
-					if(lars == True and sync_lars_start_epoch > epoch):						 					
+						for j in range(worker_per_gpu):
+							torch.nn.utils.clip_grad_norm(amp.master_params(optimizers[j]), 1000)					
+								
+					for j in range(worker_per_gpu):	
 						norms = []
-						for tensor in amp.master_params(optimizer) :
+						for tensor in amp.master_params(optimizers[j]) :
 							weight_norm = torch.norm(tensor.data).float().item()
 							if tensor.grad is None or torch.isnan(tensor.grad).any() or torch.isinf(tensor.grad).any():
 								grad_norm = 0.0
@@ -413,69 +400,22 @@ def main():
 							norm = [weight_norm, grad_norm]
 							norms.append(norm)
 						norms = torch.Tensor(norms).float().cuda()	
-						optimizer.set_norms(norms) 						
-	##
-				else:
-					if(allreduce == True and sync_grad == True):
-						tensor_flatten = flatten_tensors_grad(list(model.parameters()))
-						dist.all_reduce(tensor_flatten, op=dist.ReduceOp.SUM)
-						tensor_flatten = tensor_flatten / world_size
-						tensor_unflatten = unflatten_tensors(tensor_flatten, list(model.parameters()))	
-						for param_model, unflat in zip(model.parameters(), tensor_unflatten):
-							param_model.grad.data = unflat
-	##
-					if(crossover_flag == True and sync_grad == True):
-						crossover(model, rank, world_size, model_name, rseed_per_rank, roulettes=roulettes, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag)		
+						optimizers[j].set_norms(norms) 						
+						update_learning_rate(lrdecay, baselr, optimizers[j], maxepoch, epoch, itr, len(loader), world_size, batch_size, warmup_epoch)
+					if(rank in group_roots):
+						optimizers[0].step()
+					for j in range(worker_per_gpu):
+						optimizers[j].zero_grad()
+	
+					crossover(models, rank, world_size, model_name, rseed_per_rank, roulettes=roulettes, amp=amp, optimizer=optimizers, sync_grad=sync_grad, amp_flag=amp_flag, layer_idx=layer_idx, groups=groups, group_roots=group_roots, group_size=group_size, group_num=group_num)		
 					
-			
-					if((crossover_flag == False) and (allreduce == False) and (sync_grad == True)):
-						sgp(local_itr, model, rank, world_size, epoch, itr, len_loader, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag)
-	##
-					if(clip_grad == True):
-						torch.nn.utils.clip_grad_norm(model.parameters(), 1000)
-	##
-					if(lars == True and sync_lars_start_epoch > epoch):						 					
-						norms = []
-						for tensor in model.parameters() :
-							weight_norm = torch.norm(tensor.data).float().item()
-							grad_norm = torch.norm(tensor.grad.data).float().item()
-							norm = [weight_norm, grad_norm]
-							norms.append(norm)
-						norms = torch.Tensor(norms).float().cuda()	
-						optimizer.set_norms(norms)
-##
-	##		
-				update_learning_rate(lrdecay, baselr, optimizer, maxepoch, epoch, itr, len(loader), world_size, batch_size, warmup_epoch)
-				if(rank in group_roots):
-					optimizer.step()
-				optimizer.zero_grad()
-	##
-	##
-	##
-				#if((crossover_flag == False) and (allreduce == False)):
-				#	model.transfer_params()
-				#	model.gossip_flag.wait(timeout=300)
-				if(allreduce == True and sync_grad == False):
-					#for param in model.parameters():
-					#	dist.all_reduce(param.data, op=dist.ReduceOp.SUM, async_op=False)
-					#	param.data = param.data *(1.0/world_size)
-					tensor_flatten = flatten_tensors(list(amp.master_params(optimizer)))
-					dist.all_reduce(tensor_flatten, op=dist.ReduceOp.SUM)
-					tensor_flatten = tensor_flatten / world_size
-					tensor_unflatten = unflatten_tensors(tensor_flatten, list(amp.master_params(optimizer)))	
-					for param_model, unflat in zip(amp.master_params(optimizer), tensor_unflatten):
-						param_model.data = unflat
-	##
-				if(crossover_flag == True and sync_grad == False):
-					crossover(model, rank, world_size, model_name, rseed_per_rank, roulettes=roulettes, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag, layer_idx=layer_idx, groups=groups, group_roots=group_roots, group_size=group_size, group_num=group_num)		
-	##
-				if((crossover_flag == False) and (allreduce == False) and (sync_grad == False)):
-					sgp(local_itr, model, rank, world_size, epoch, itr, len_loader, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag, iter_num=iter_num, layer_idx=layer_idx)
-				iter_num = iter_num +1
-			#optimizer.step()
-			#optimizer.zero_grad()
-				print(time.time() - minibatch_time)	
-				minibatch_data_load_itme = time.time()
+					for j in range(worker_per_gpu-1):
+						for root, group_worker in zip(amp.master_params(optimizers[0]), amp.master_params(optimizers[j+1])):
+							group_worker.data = root.data
+				
+					iter_num = iter_num +1
+					print(time.time() - minibatch_time)	
+					minibatch_data_load_itme = time.time()
 		elapsed_time = time.time()-batch_time
 		if(rank == 0):
 			for param_group in optimizer.param_groups:
@@ -483,7 +423,7 @@ def main():
 		if(((epoch+1)%val_iter == 0) and (rank % proc_per_node == 0)):
 			losses,top1 = validate(model, val_loader, criterion)
 	
-			with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
+			with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{worker_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
 				print('{ep}, {rank}, '
 					'{loss:.4f},'
 					'{top1:.3f},'
@@ -494,7 +434,7 @@ def main():
 		dist.barrier()
 	if(rank % proc_per_node == 0):
 		losses,top1 = validate(model, val_loader, criterion)
-		with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
+		with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{worker_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
 			print('{ep}, {rank}, '
 				'{loss:.4f},'
 				'{top1:.3f},'
@@ -824,8 +764,6 @@ def crossover_comm(param, receive_from, send_to, select_rank, rank, world_size, 
 			completed_send.wait()
 			param_reduced_this_group.data.copy_(0.5*(param_reduced_this_group.data+param_reduced.data))
 		dist.barrier()
-		torch.cuda.synchronize()
-
 		dist.broadcast(tensor=param_reduced_this_group.data,src=group_roots[mygroup], group=groups[mygroup])
 		#completed_send.wait()
 
@@ -834,27 +772,8 @@ def crossover_comm(param, receive_from, send_to, select_rank, rank, world_size, 
 		
 		for p, cp in zip(part_model, tensor_unflatten):
 			p.data = cp
-		tensor_unflatten = None
-		param_reduced_this_group = None
+
 				
-	else:
-		send_queue = []
-		#param_send = param.clone().detach()
-		#for dest in send_to:
-		completed_send = dist.isend(tensor=param.data, dst=send_to)
-		send_queue.append(completed_send)
-		#completed_recv = dist.irecv(tensor=param.data, src=receive_from)
-		dist.recv(tensor=param.data, src=receive_from)
-		for send in send_queue :
-			send.wait()
-		#completed_send.wait()
-		torch.cuda.synchronize()
-		dist.barrier()	
-		tensor_unflatten = unflatten_tensors(param, part_model)
-		for p, cp in zip(part_model, tensor_unflatten):
-			p.data.copy_(0.5*(cp.data+p.data))
-		#tensor_unflatten = None	
-		#param_send = None
 
 
 def crossover(model, rank, world_size, model_name, rseed_per_rank, roulettes=None, amp=None, optimizer=None, sync_grad=False, amp_flag=False, layer_idx=None, groups=None, group_roots=None, group_size=None, group_num=None):
@@ -864,20 +783,16 @@ def crossover(model, rank, world_size, model_name, rseed_per_rank, roulettes=Non
 	for i in range(len(layer_idx)):
 		part_model = None	
 		if(i==0):
-			part_model = list(amp.master_params(optimizer))[0:layer_idx[i]]
+			part_model = list(amp.master_params(optimizer[0]))[0:layer_idx[i]]
 		else :
-			part_model = list(amp.master_params(optimizer))[layer_idx[i-1]:layer_idx[i]]
+			part_model = list(amp.master_params(optimizer[0]))[layer_idx[i-1]:layer_idx[i]]
 
 		tensor_flatten = flatten_tensors(part_model)
 		select_rank = select_layer(rank, rseed_per_rank, group_num, roulettes)
 		receive_from = select_rank[int(rank/group_size)]		 
 		send_to = select_rank.index(int(rank/group_size))
-		dist.barrier()					
-		torch.cuda.synchronize()
-		#send_to = list(filter(lambda x: select_rank[x] == int(rank/group_size), range(len(select_rank))))
 		crossover_comm(tensor_flatten, receive_from, send_to, select_rank, rank, world_size, groups, group_roots, group_size, group_num, part_model)
 		#tensor_unflatten = unflatten_tensors(tensors[i], part_model)
-		tensor_flatten = None
 
 if __name__ == '__main__':
 

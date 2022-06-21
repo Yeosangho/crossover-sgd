@@ -385,15 +385,6 @@ def main():
 						tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizer)))	
 						for param_model, unflat in zip(amp.master_params(optimizer), tensor_unflatten):
 							param_model.grad.data = unflat					
-					if(crossover_flag == True and group_size > 1):
-						tensor_flatten = flatten_tensors_grad(list(amp.master_params(optimizer)))
-						dist.reduce(tensor_flatten, dst=group_roots[mygroup], op=dist.ReduceOp.SUM, group=groups[mygroup])
-						if(rank in group_roots):
-							tensor_flatten = tensor_flatten / group_size
-							tensor_unflatten = unflatten_tensors_grad(tensor_flatten, list(amp.master_params(optimizer)))	
-							for param_model, unflat in zip(amp.master_params(optimizer), tensor_unflatten):
-								param_model.grad.data = unflat	
-
 							
 					#	crossover(model,  rank, world_size, model_name, rseed_per_rank, roulettes=roulettes, elitism=False, elite_ratio=elite_ratio, amp=amp, optimizer=optimizer, sync_grad=sync_grad, amp_flag=amp_flag)		
 					#if((crossover_flag == False) and (allreduce == False) and (sync_grad == True)):
@@ -483,7 +474,7 @@ def main():
 		if(((epoch+1)%val_iter == 0) and (rank % proc_per_node == 0)):
 			losses,top1 = validate(model, val_loader, criterion)
 	
-			with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
+			with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_nofaireness_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
 				print('{ep}, {rank}, '
 					'{loss:.4f},'
 					'{top1:.3f},'
@@ -494,7 +485,7 @@ def main():
 		dist.barrier()
 	if(rank % proc_per_node == 0):
 		losses,top1 = validate(model, val_loader, criterion)
-		with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
+		with open(f'/scratch/x2223a02/x2026a02/{args.tag}_{file_prefix}_nofaireness_{world_size}_{batch_size}_{local_itr}_{rank}_sync_lars_start_at_{sync_lars_start_epoch}_group_num_{group_num}_amp_{amp_flag}_clip_grad_{clip_grad}_baselr_{baselr}_maxepoch_{maxepoch}_lrdecay_{lrdecay}_lars_{lars}_lars_coef_{lars_coef}_chromo_{args.chromosome}_'+'val.csv', '+a') as f:
 			print('{ep}, {rank}, '
 				'{loss:.4f},'
 				'{top1:.3f},'
@@ -729,8 +720,8 @@ def select_layer(rank, rseed_per_rank, world_size, roulettes):
 	select_rank = []
 	copy_roulettes = deepcopy(roulettes)
 	for i in range(0,world_size):
-		for j in select_rank :
-				copy_roulettes[i][j] = 0
+		#for j in select_rank :
+		#		copy_roulettes[i][j] = 0
 		roulette_sum = sum(copy_roulettes[i])
 		copy_roulettes[i] = [ r/roulette_sum for r in copy_roulettes[i]]
 		if((world_size-2 == i) and ((world_size-1) not in select_rank)):
@@ -824,8 +815,6 @@ def crossover_comm(param, receive_from, send_to, select_rank, rank, world_size, 
 			completed_send.wait()
 			param_reduced_this_group.data.copy_(0.5*(param_reduced_this_group.data+param_reduced.data))
 		dist.barrier()
-		torch.cuda.synchronize()
-
 		dist.broadcast(tensor=param_reduced_this_group.data,src=group_roots[mygroup], group=groups[mygroup])
 		#completed_send.wait()
 
@@ -840,9 +829,9 @@ def crossover_comm(param, receive_from, send_to, select_rank, rank, world_size, 
 	else:
 		send_queue = []
 		#param_send = param.clone().detach()
-		#for dest in send_to:
-		completed_send = dist.isend(tensor=param.data, dst=send_to)
-		send_queue.append(completed_send)
+		for dest in send_to:
+			completed_send = dist.isend(tensor=param.data, dst=dest)
+			send_queue.append(completed_send)
 		#completed_recv = dist.irecv(tensor=param.data, src=receive_from)
 		dist.recv(tensor=param.data, src=receive_from)
 		for send in send_queue :
@@ -871,10 +860,10 @@ def crossover(model, rank, world_size, model_name, rseed_per_rank, roulettes=Non
 		tensor_flatten = flatten_tensors(part_model)
 		select_rank = select_layer(rank, rseed_per_rank, group_num, roulettes)
 		receive_from = select_rank[int(rank/group_size)]		 
-		send_to = select_rank.index(int(rank/group_size))
+		#send_to = select_rank.index(int(rank/group_size))
 		dist.barrier()					
 		torch.cuda.synchronize()
-		#send_to = list(filter(lambda x: select_rank[x] == int(rank/group_size), range(len(select_rank))))
+		send_to = list(filter(lambda x: select_rank[x] == int(rank/group_size), range(len(select_rank))))
 		crossover_comm(tensor_flatten, receive_from, send_to, select_rank, rank, world_size, groups, group_roots, group_size, group_num, part_model)
 		#tensor_unflatten = unflatten_tensors(tensors[i], part_model)
 		tensor_flatten = None
